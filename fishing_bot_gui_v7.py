@@ -28,10 +28,14 @@ Alem disso, o PROGRAMA Tesseract-OCR precisa estar instalado:
 """
 
 import json
+import logging
 import os
 import time
 import difflib
 import threading
+import queue
+import tempfile
+from enum import Enum
 from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -53,10 +57,164 @@ except ImportError:
 
 pydirectinput.FAILSAFE = False
 
-CONFIG_PATH = "config.json"
-BASELINE_PATH = "slot_baseline.png"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+BASELINE_PATH = os.path.join(APP_DIR, "slot_baseline.png")
 HOTKEY_PARAR = "f8"
 FRASES_DUPLICATA_PADRAO = "you can only store one of each fruit"
+LOG_PATH = os.path.join(APP_DIR, "fishing_bot.log")
+
+# Adotado dos exemplos: estados, logging local e métricas tornam falhas
+# operacionais observáveis sem adicionar integrações externas. Combate,
+# exploração, webhooks/Discord e qualquer automação fora da pesca ficam
+# explicitamente fora do escopo.
+LOGGER = logging.getLogger("fishing_bot")
+LOGGER.setLevel(logging.INFO)
+_LOGGING_CONFIGURED = False
+if not LOGGER.handlers:
+    LOGGER.addHandler(logging.StreamHandler())
+
+
+def _ensure_logging_configured():
+    """Tenta habilitar arquivo; mantém console explícito se o diretório não permitir."""
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    try:
+        handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    except OSError as exc:
+        LOGGER.warning("Nao foi possivel abrir log em %s: %s; usando console.", LOG_PATH, exc)
+    else:
+        LOGGER.addHandler(handler)
+    _LOGGING_CONFIGURED = True
+
+
+class BotState(Enum):
+    PARADO = "parado"
+    RODANDO = "rodando"
+    PAUSADO_FRUTA = "pausado - fruta/OCR"
+    PAUSADO_ISCA = "pausado - sem isca"
+    ERRO = "erro"
+    ENCERRANDO = "encerrando"
+
+
+class BotMetrics:
+    """Métricas de captura e alterações de slot, thread-safe e sem GUI."""
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._inicio = clock()
+        self._frames = 0
+        self._eventos_slot = 0
+        self._lock = threading.Lock()
+
+    def frame(self, quantidade=1):
+        with self._lock:
+            self._frames += quantidade
+
+    def fruta_detectada(self):
+        """Alias compatível: o evento medido é uma alteração do slot."""
+        with self._lock:
+            self._eventos_slot += 1
+
+    def snapshot(self):
+        with self._lock:
+            decorrido = max(0.001, self._clock() - self._inicio)
+            return {
+                "frames": self._frames,
+                "eventos_slot": self._eventos_slot,
+                "eventos_fruta": self._eventos_slot,
+                "fps": self._frames / decorrido,
+                "eventos_por_hora": self._eventos_slot * 3600.0 / decorrido,
+            }
+
+
+class InputController:
+    """Abstração mínima testável sobre pydirectinput; mantém o escopo da pesca."""
+
+    def click(self, *args, **kwargs):
+        return pydirectinput.click(*args, **kwargs)
+
+    def mouse_down(self):
+        return pydirectinput.mouseDown()
+
+    def mouse_up(self):
+        return pydirectinput.mouseUp()
+
+    def press(self, tecla):
+        return pydirectinput.press(tecla)
+
+
+class ScreenCapture:
+    """Abstração de captura para permitir testes sem abrir uma tela real."""
+
+    def __enter__(self):
+        self._captura = mss.mss()
+        return self._captura
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._captura.close()
+
+
+def configuracao_padrao():
+    return {
+        "frutas_possuidas": [],
+        "posicoes_isca": [],
+        "fruta": {
+            "tecla_guardar": "e",
+            "limiar_diff": 20.0,
+            "cooldown_segundos": 8.0,
+            "limiar_nome": 0.6,
+            "frases_duplicata": FRASES_DUPLICATA_PADRAO,
+        },
+        "loop": {"margem_pixels": 4, "intervalo_segundos": 0.02},
+    }
+
+
+def validar_regiao_pct(area):
+    if not isinstance(area, dict):
+        return False
+    try:
+        valores = [float(area[chave]) for chave in ("x1_pct", "y1_pct", "x2_pct", "y2_pct")]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(0.0 <= valor <= 1.0 for valor in valores) and valores[0] < valores[2] and valores[1] < valores[3]
+
+
+def monitor_principal(sct):
+    monitores = sct.monitors
+    if len(monitores) < 2:
+        raise RuntimeError("Nenhum monitor físico disponível para calibracao.")
+    monitor = monitores[1]
+    return {
+        "left": int(monitor.get("left", 0)),
+        "top": int(monitor.get("top", 0)),
+        "width": int(monitor["width"]),
+        "height": int(monitor["height"]),
+    }
+
+
+def normalizar_config(cfg):
+    """Aplica defaults e rejeita somente estruturas inválidas, sem perder dados válidos."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    resultado = configuracao_padrao()
+    resultado.update(cfg)
+    if not isinstance(resultado.get("frutas_possuidas"), list):
+        resultado["frutas_possuidas"] = []
+    if not isinstance(resultado.get("posicoes_isca"), list):
+        resultado["posicoes_isca"] = []
+    fruta = configuracao_padrao()["fruta"]
+    fruta.update(resultado.get("fruta") if isinstance(resultado.get("fruta"), dict) else {})
+    resultado["fruta"] = fruta
+    loop = configuracao_padrao()["loop"]
+    loop.update(resultado.get("loop") if isinstance(resultado.get("loop"), dict) else {})
+    resultado["loop"] = loop
+    for chave in ("regiao_pesca", "regiao_slot_fruta", "regiao_texto_erro",
+                  "regiao_contador_isca", "regiao_nome_fruta"):
+        if chave in resultado and not validar_regiao_pct(resultado[chave]):
+            resultado.pop(chave)
+    return resultado
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +310,16 @@ class JanelaCalibracaoAreas:
         self.ao_confirmar = ao_confirmar
         cfg_existente = cfg_existente or {}
 
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]
+        with ScreenCapture() as sct:
+            monitor = monitor_principal(sct)
+            self.origem_x = monitor["left"]
+            self.origem_y = monitor["top"]
             self.largura = monitor["width"]
             self.altura = monitor["height"]
 
         self.janela = tk.Toplevel(parent)
         self.janela.overrideredirect(True)
-        self.janela.geometry(f"{self.largura}x{self.altura}+0+0")
+        self.janela.geometry(f"{self.largura}x{self.altura}+{self.origem_x}+{self.origem_y}")
         self.janela.attributes("-topmost", True)
         self.janela.configure(bg=COR_TRANSPARENTE)
         self.janela.wm_attributes("-transparentcolor", COR_TRANSPARENTE)
@@ -229,14 +389,16 @@ class JanelaMarcarPonto:
 
     def __init__(self, parent, ao_confirmar):
         self.ao_confirmar = ao_confirmar
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]
+        with ScreenCapture() as sct:
+            monitor = monitor_principal(sct)
+            self.origem_x = monitor["left"]
+            self.origem_y = monitor["top"]
             self.largura = monitor["width"]
             self.altura = monitor["height"]
 
         self.janela = tk.Toplevel(parent)
         self.janela.overrideredirect(True)
-        self.janela.geometry(f"{self.largura}x{self.altura}+0+0")
+        self.janela.geometry(f"{self.largura}x{self.altura}+{self.origem_x}+{self.origem_y}")
         self.janela.attributes("-topmost", True)
         self.janela.configure(bg=COR_TRANSPARENTE)
         self.janela.wm_attributes("-transparentcolor", COR_TRANSPARENTE)
@@ -292,12 +454,12 @@ def hsv_de_ponto(frame, ponto_pct, largura, altura, margem=15):
     return lower, upper
 
 
-def calcular_regiao_pixels(area_pct, largura_atual, altura_atual):
+def calcular_regiao_pixels(area_pct, largura_atual, altura_atual, origem_x=0, origem_y=0):
     x1 = int(area_pct["x1_pct"] * largura_atual)
     y1 = int(area_pct["y1_pct"] * altura_atual)
     x2 = int(area_pct["x2_pct"] * largura_atual)
     y2 = int(area_pct["y2_pct"] * altura_atual)
-    return {"top": y1, "left": x1, "width": max(1, x2 - x1), "height": max(1, y2 - y1)}
+    return {"top": origem_y + y1, "left": origem_x + x1, "width": max(1, x2 - x1), "height": max(1, y2 - y1)}
 
 
 def centro_y_da_cor(frame_bgr, lower, upper):
@@ -390,6 +552,36 @@ def nome_bate_com_lista(texto_lido, lista_nomes, limiar=0.6):
             melhor_score = score
             melhor_nome = nome
     return (melhor_score >= limiar), melhor_nome, melhor_score
+
+
+def decidir_ocr_fruta(texto_lido, lista_nomes, limiar=0.6):
+    """Decide de forma segura: OCR vazio/incerto nunca vira fruta nova."""
+    texto = (texto_lido or "").strip().lower()
+    if not texto:
+        return {"acao": "pausar", "motivo": "OCR vazio", "score": 0.0, "nome": None}
+
+    duplicata, nome, score = nome_bate_com_lista(texto, lista_nomes, limiar)
+    if duplicata:
+        return {"acao": "descartar", "motivo": "fruta já possuída", "score": score, "nome": nome}
+    if lista_nomes and score < limiar:
+        return {"acao": "pausar", "motivo": "OCR incerto; não corresponde à lista conhecida",
+                "score": score, "nome": nome}
+    return {"acao": "guardar", "motivo": "nome OCR confirmado", "score": score, "nome": texto}
+
+
+def decidir_leitura_isca(numero, zeros_consecutivos, limite=3):
+    """OCR inválido não conta como zero; só zeros válidos consecutivos disparam troca."""
+    if numero is None:
+        return {"acao": "invalida", "zeros_consecutivos": 0}
+    if numero < 0:
+        return {"acao": "invalida", "zeros_consecutivos": 0}
+    if numero == 0:
+        zeros = zeros_consecutivos + 1
+        return {
+            "acao": "acabou" if zeros >= limite else "aguardar",
+            "zeros_consecutivos": zeros,
+        }
+    return {"acao": "normal", "zeros_consecutivos": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -507,8 +699,17 @@ class FishingBotApp:
         self.macro_rodando = threading.Event()
         self.pausar_para_fruta = threading.Event()
         self.pausar_sem_isca = threading.Event()
+        self._ui_queue = queue.Queue()
+        self._workers = []
+        self._closing = threading.Event()
+        self._hotkey_handle = None
+        self.estado = BotState.PARADO
+        self.metrics = BotMetrics()
+        self.input = InputController()
 
         self._montar_interface()
+        self.root.after(50, self._drenar_atualizacoes_ui)
+        self.root.protocol("WM_DELETE_WINDOW", self.encerrar)
         self._registrar_hotkey_emergencia()
 
         if not OCR_DISPONIVEL:
@@ -573,7 +774,7 @@ class FishingBotApp:
         self.btn_iniciar = ttk.Button(frame_botoes, text="4. Iniciar Macro", command=self.iniciar_macro)
         self.btn_iniciar.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        self.btn_continuar_isca = ttk.Button(frame_botoes, text="Continuar (troquei a isca)",
+        self.btn_continuar_isca = ttk.Button(frame_botoes, text="Continuar (isca/OCR)",
                                               command=self.continuar_apos_isca, state="disabled")
         self.btn_continuar_isca.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
 
@@ -598,26 +799,68 @@ class FishingBotApp:
         if not self.var_isca_fallback.get():
             self.var_isca_fallback.set(nomes[0])
 
-    def log(self, mensagem):
+    def log(self, mensagem, nivel=logging.INFO):
+        _ensure_logging_configured()
+        LOGGER.log(nivel, mensagem)
         def _escrever():
             self.txt_log.config(state="normal")
             self.txt_log.insert("end", f"{mensagem}\n")
             self.txt_log.see("end")
             self.txt_log.config(state="disabled")
-        self.root.after(0, _escrever)
+        self._agendar_ui(_escrever)
 
     def set_status(self, texto, cor="gray"):
-        self.root.after(0, lambda: self.lbl_status.config(text=f"Status: {texto}", foreground=cor))
+        self._agendar_ui(lambda: self.lbl_status.config(text=f"Status: {texto}", foreground=cor))
+
+    def _definir_estado(self, estado):
+        self.estado = estado
+        cor = "red" if estado == BotState.ERRO else (
+            "orange" if estado in (BotState.PAUSADO_FRUTA, BotState.PAUSADO_ISCA)
+            else "green" if estado == BotState.RODANDO else "gray"
+        )
+        self.set_status(estado.value, cor)
+
+    def _agendar_ui(self, callback):
+        """Workers só enfileiram; o callback é executado pelo mainloop."""
+        self._ui_queue.put(callback)
+
+    def _drenar_atualizacoes_ui(self):
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            callback()
+        if self.root.winfo_exists():
+            self.root.after(50, self._drenar_atualizacoes_ui)
 
     def _carregar_config_completa(self):
-        if os.path.exists(CONFIG_PATH):
+        if not os.path.exists(CONFIG_PATH):
+            return configuracao_padrao()
+        try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {}
+                return normalizar_config(json.load(f))
+        except (OSError, ValueError, TypeError) as exc:
+            self.log(f"AVISO: configuracao invalida, usando defaults ({exc}).")
+            return configuracao_padrao()
 
     def _salvar_config_completa(self, cfg):
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        cfg = normalizar_config(cfg)
+        pasta = os.path.dirname(CONFIG_PATH) or APP_DIR
+        os.makedirs(pasta, exist_ok=True)
+        fd, temporario = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=pasta)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporario, CONFIG_PATH)
+        except Exception:
+            try:
+                os.unlink(temporario)
+            except OSError:
+                pass
+            raise
 
     def _valor_config_fruta(self, chave, padrao):
         return self._carregar_config_completa().get("fruta", {}).get(chave, padrao)
@@ -662,6 +905,11 @@ class FishingBotApp:
 
     def _salvar_areas(self, area_pesca, area_slot, area_texto_erro,
                        area_contador_isca, area_nome_fruta, resolucao):
+        areas = (area_pesca, area_slot, area_texto_erro, area_contador_isca, area_nome_fruta)
+        if not all(validar_regiao_pct(area) for area in areas):
+            self.log("Areas invalidas: cada retangulo deve estar dentro do monitor e ter tamanho positivo.")
+            self.set_status("calibracao invalida", "red")
+            return
         cfg = self._carregar_config_completa()
         cfg["regiao_pesca"] = area_pesca
         cfg["regiao_slot_fruta"] = area_slot
@@ -679,13 +927,13 @@ class FishingBotApp:
         if "regiao_pesca" not in cfg:
             messagebox.showwarning("Fishing Bot", "Ajuste as areas primeiro (passo 1).")
             return
-        threading.Thread(target=self._rodar_calibracao_cores, args=(cfg,), daemon=True).start()
+        self._iniciar_worker(self._rodar_calibracao_cores, cfg)
 
     def _rodar_calibracao_cores(self, cfg):
         try:
             self.set_status("calibrando cores", "orange")
             with mss.mss() as sct:
-                monitor = sct.monitors[1]
+                monitor = monitor_principal(sct)
                 largura, altura = monitor["width"], monitor["height"]
                 frame = np.array(sct.grab(monitor))[:, :, :3]
 
@@ -733,14 +981,16 @@ class FishingBotApp:
             "Va para o jogo AGORA e garanta que o slot calibrado esta VAZIO/normal. "
             "Clique OK - vai tirar o print em 3 segundos."
         )
-        threading.Thread(target=self._rodar_captura_baseline, args=(cfg,), daemon=True).start()
+        self._iniciar_worker(self._rodar_captura_baseline, cfg)
 
     def _rodar_captura_baseline(self, cfg):
         time.sleep(3)
         with mss.mss() as sct:
-            monitor = sct.monitors[1]
+            monitor = monitor_principal(sct)
             largura, altura = monitor["width"], monitor["height"]
-            regiao_px = calcular_regiao_pixels(cfg["regiao_slot_fruta"], largura, altura)
+            regiao_px = calcular_regiao_pixels(
+                cfg["regiao_slot_fruta"], largura, altura, monitor["left"], monitor["top"]
+            )
             frame = np.array(sct.grab(regiao_px))[:, :, :3]
         cv2.imwrite(BASELINE_PATH, frame)
         cfg["fruta_baseline_arquivo"] = BASELINE_PATH
@@ -766,6 +1016,8 @@ class FishingBotApp:
         self._salvar_config_completa(cfg)
 
         self.macro_rodando.set()
+        self._definir_estado(BotState.RODANDO)
+        self.metrics = BotMetrics()
         self.pausar_para_fruta.clear()
         self.pausar_sem_isca.clear()
         self.btn_iniciar.config(state="disabled")
@@ -776,38 +1028,96 @@ class FishingBotApp:
         self.set_status("rodando", "green")
         self.log("Macro iniciado. Va para o jogo. F8 para parar.")
 
-        threading.Thread(target=self._loop_macro, args=(cfg,), daemon=True).start()
+        self._iniciar_worker(self._loop_macro, cfg)
         if self.var_deteccao_fruta.get() and OCR_DISPONIVEL:
-            threading.Thread(target=self._loop_deteccao_fruta, args=(cfg,), daemon=True).start()
+            self._iniciar_worker(self._loop_deteccao_fruta, cfg)
         if self.var_monitorar_isca.get() and OCR_DISPONIVEL and "regiao_contador_isca" in cfg:
-            threading.Thread(target=self._loop_monitorar_isca, args=(cfg,), daemon=True).start()
+            self._iniciar_worker(self._loop_monitorar_isca, cfg)
+
+    def _iniciar_worker(self, alvo, cfg):
+        trabalhador = threading.Thread(target=self._executar_worker, args=(alvo, cfg), daemon=True)
+        self._workers.append(trabalhador)
+        trabalhador.start()
+
+    def _executar_worker(self, alvo, cfg):
+        """Converte qualquer falha de worker em parada explícita e segura."""
+        try:
+            alvo(cfg)
+        except Exception as exc:
+            nome = getattr(alvo, "__name__", "worker")
+            self.log(f"Erro no {nome}: {exc!r}. Automacao interrompida com seguranca.", logging.ERROR)
+            self._finalizar_macro(BotState.ERRO)
+
+    def _finalizar_macro(self, estado=BotState.PARADO):
+        """Finaliza de forma idempotente e atualiza todos os controles da GUI."""
+        self.macro_rodando.clear()
+        self.pausar_para_fruta.set()
+        self.pausar_sem_isca.set()
+        try:
+            self.input.mouse_up()
+        except Exception as exc:
+            self.log(f"Erro ao liberar mouse durante finalizacao: {exc!r}", logging.ERROR)
+        self._definir_estado(estado)
+        for btn in (self.btn_iniciar, self.btn_areas, self.btn_cores, self.btn_baseline):
+            self._agendar_ui(lambda b=btn: b.config(state="normal"))
+        self._agendar_ui(lambda: self.btn_parar.config(state="disabled"))
+        self._agendar_ui(lambda: self.btn_continuar_isca.config(state="disabled"))
 
     def parar_macro(self):
         if self.macro_rodando.is_set():
-            self.macro_rodando.clear()
-            pydirectinput.mouseUp()
             self.log("Macro parado.")
-            self.set_status("parado", "gray")
-        for btn in (self.btn_iniciar, self.btn_areas, self.btn_cores, self.btn_baseline):
-            self.root.after(0, lambda b=btn: b.config(state="normal"))
-        self.root.after(0, lambda: self.btn_parar.config(state="disabled"))
-        self.root.after(0, lambda: self.btn_continuar_isca.config(state="disabled"))
+        self._finalizar_macro(BotState.PARADO)
+
+    def encerrar(self):
+        """Para a automação antes de destruir a janela e seus recursos."""
+        if self._closing.is_set():
+            return
+        self._closing.set()
+        self._definir_estado(BotState.ENCERRANDO)
+        self.macro_rodando.clear()
+        self.pausar_para_fruta.set()
+        self.pausar_sem_isca.set()
+        try:
+            self.input.mouse_up()
+        except Exception as exc:
+            self.log(f"Aviso ao liberar mouse durante encerramento: {exc}")
+        if self._hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self._hotkey_handle)
+            except Exception as exc:
+                self.log(f"Aviso ao remover hotkey: {exc}")
+            self._hotkey_handle = None
+        for trabalhador in list(self._workers):
+            trabalhador.join(timeout=2.0)
+        self._workers.clear()
+        try:
+            cv2.destroyAllWindows()
+        except Exception as exc:
+            self.log(f"Aviso ao fechar overlays de calibracao: {exc}")
+        for janela in self.root.winfo_children():
+            if isinstance(janela, tk.Toplevel):
+                janela.destroy()
+        self.root.destroy()
 
     def continuar_apos_isca(self):
         self.pausar_sem_isca.clear()
+        self.pausar_para_fruta.clear()
+        self._definir_estado(BotState.RODANDO)
         self.btn_continuar_isca.config(state="disabled")
-        self.log("Retomando apos troca de isca.")
+        self.log("Retomando apos troca de isca ou revisao do OCR.")
         self.set_status("rodando", "green")
 
     def _loop_macro(self, cfg):
         try:
-            pydirectinput.click()
+            self.input.click()
             time.sleep(1.0)
 
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]
+            with ScreenCapture() as sct:
+                monitor = monitor_principal(sct)
                 largura_atual, altura_atual = monitor["width"], monitor["height"]
-                regiao_px = calcular_regiao_pixels(cfg["regiao_pesca"], largura_atual, altura_atual)
+                regiao_px = calcular_regiao_pixels(
+                    cfg["regiao_pesca"], largura_atual, altura_atual, monitor["left"], monitor["top"]
+                )
 
                 verde = cfg["cores"]["zona_verde"]
                 marcador = cfg["cores"]["marcador"]
@@ -849,7 +1159,7 @@ class FishingBotApp:
                 while self.macro_rodando.is_set():
                     if self.pausar_para_fruta.is_set() or self.pausar_sem_isca.is_set():
                         if segurando:
-                            pydirectinput.mouseUp()
+                            self.input.mouse_up()
                             segurando = False
                         y_marcador_anterior = None
                         tempo_anterior = None
@@ -863,6 +1173,7 @@ class FishingBotApp:
                     y_marcador = centro_y_da_cor(frame, marcador["lower"], marcador["upper"])
 
                     contagem_frames += 1
+                    self.metrics.frame()
                     if agora - inicio_janela_fps >= 2.0:
                         fps_real = contagem_frames / (agora - inicio_janela_fps)
                         self.log(f"[auto] fps={fps_real:.1f} | margem={margem}px | "
@@ -872,7 +1183,7 @@ class FishingBotApp:
 
                     if y_verde is None or y_marcador is None:
                         if segurando:
-                            pydirectinput.mouseUp()
+                            self.input.mouse_up()
                             segurando = False
                         y_marcador_anterior = None
                         tempo_anterior = None
@@ -880,7 +1191,7 @@ class FishingBotApp:
                         if tempo_sem_barra_inicio is None:
                             tempo_sem_barra_inicio = agora
                         elif agora - tempo_sem_barra_inicio >= LIMITE_RECAST_SEGUNDOS:
-                            pydirectinput.click()
+                            self.input.click()
                             tempo_sem_barra_inicio = None
                         continue  # sem sleep - roda no limite do hardware
 
@@ -918,10 +1229,10 @@ class FishingBotApp:
                     diferenca = y_previsto - y_verde
                     estado_anterior = segurando
                     if diferenca > margem and not segurando:
-                        pydirectinput.mouseDown()
+                        self.input.mouse_down()
                         segurando = True
                     elif diferenca < -margem and segurando:
-                        pydirectinput.mouseUp()
+                        self.input.mouse_up()
                         segurando = False
                     if segurando != estado_anterior:
                         contagem_toggles += 1
@@ -945,11 +1256,11 @@ class FishingBotApp:
                     # captura de tela + processamento permitirem no seu hardware
 
                 if segurando:
-                    pydirectinput.mouseUp()
+                    self.input.mouse_up()
         except Exception as e:
             self.log(f"Erro no macro: {e}")
             self.set_status("erro", "red")
-            self.root.after(0, self.parar_macro)
+            self._agendar_ui(self.parar_macro)
 
     def _loop_deteccao_fruta(self, cfg):
         baseline_img = cv2.imread(cfg.get("fruta_baseline_arquivo", BASELINE_PATH))
@@ -966,13 +1277,17 @@ class FishingBotApp:
         tecla_guardar = cfg_fruta.get("tecla_guardar", "e")
         frutas_possuidas = cfg.get("frutas_possuidas", [])
 
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]
+        with ScreenCapture() as sct:
+            monitor = monitor_principal(sct)
             largura, altura = monitor["width"], monitor["height"]
-            regiao_slot_px = calcular_regiao_pixels(cfg["regiao_slot_fruta"], largura, altura)
-            regiao_erro_px = (calcular_regiao_pixels(cfg["regiao_texto_erro"], largura, altura)
+            regiao_slot_px = calcular_regiao_pixels(
+                cfg["regiao_slot_fruta"], largura, altura, monitor["left"], monitor["top"]
+            )
+            regiao_erro_px = (calcular_regiao_pixels(
+                cfg["regiao_texto_erro"], largura, altura, monitor["left"], monitor["top"])
                                if "regiao_texto_erro" in cfg else None)
-            regiao_nome_px = (calcular_regiao_pixels(cfg["regiao_nome_fruta"], largura, altura)
+            regiao_nome_px = (calcular_regiao_pixels(
+                cfg["regiao_nome_fruta"], largura, altura, monitor["left"], monitor["top"])
                                if "regiao_nome_fruta" in cfg else None)
 
             ultimo_disparo = 0
@@ -991,27 +1306,31 @@ class FishingBotApp:
                 if contagem_mudanca >= 2:
                     self.log(f"Slot mudou (diff={diff:.1f}) - possivel fruta. Pausando pesca.")
                     self.pausar_para_fruta.set()
-                    pydirectinput.mouseUp()
+                    self.input.mouse_up()
+                    self._definir_estado(BotState.PAUSADO_FRUTA)
+                    self.metrics.fruta_detectada()
                     time.sleep(0.6)
 
                     # recarrega a lista mais recente (pode ter sido editada durante a sessao)
                     frutas_possuidas = self._carregar_config_completa().get("frutas_possuidas", [])
                     ja_resolvido = False
+                    ocr_inconclusivo = False
 
                     if frutas_possuidas and regiao_nome_px is not None:
                         frame_nome = np.array(sct.grab(regiao_nome_px))[:, :, :3]
                         texto_nome = ler_texto(frame_nome)
-                        duplicata, nome_bateu, score = nome_bate_com_lista(texto_nome, frutas_possuidas, limiar_nome)
-
-                        if duplicata:
+                        decisao = decidir_ocr_fruta(texto_nome, frutas_possuidas, limiar_nome)
+                        if decisao["acao"] == "descartar":
+                            nome_bateu = decisao["nome"]
+                            score = decisao["score"]
                             self.log(f"Nome lido ('{texto_nome}') bate com '{nome_bateu}' (score={score:.2f}). "
                                      f"Ja possuida - descartando com Backspace.")
-                            pydirectinput.press("backspace")
+                            self.input.press("backspace")
                             ja_resolvido = True
-                        else:
-                            self.log(f"Nome lido ('{texto_nome}') nao bate com nenhuma fruta conhecida "
-                                     f"(melhor score={score:.2f}). Guardando como nova (tecla '{tecla_guardar}').")
-                            pydirectinput.press(tecla_guardar)
+                        elif decisao["acao"] == "guardar":
+                            self.log(f"Nome lido ('{texto_nome}') confirmado. "
+                                     f"Guardando com a tecla '{tecla_guardar}'.")
+                            self.input.press(tecla_guardar)
                             if texto_nome:
                                 nova_lista = frutas_possuidas + [texto_nome.title()]
                                 cfg_atual = self._carregar_config_completa()
@@ -1019,12 +1338,18 @@ class FishingBotApp:
                                 self._salvar_config_completa(cfg_atual)
                                 self.log(f"Adicionei '{texto_nome.title()}' a lista de Minhas Frutas.")
                             ja_resolvido = True
+                        else:
+                            self.log(f"PAUSADO: {decisao['motivo']} (texto='{texto_nome}', "
+                                     f"score={decisao['score']:.2f}). Revise a fruta e clique Continuar.")
+                            self._definir_estado(BotState.PAUSADO_FRUTA)
+                            self._agendar_ui(lambda: self.btn_continuar_isca.config(state="normal"))
+                            ocr_inconclusivo = True
 
-                    if not ja_resolvido:
+                    if not ja_resolvido and not ocr_inconclusivo:
                         # sem lista manual configurada: aperta a tecla do prompt e checa mensagem de erro
                         self.log(f"Apertando '{tecla_guardar}' (prompt Store Fruit). "
                                  f"Verificando mensagem de erro...")
-                        pydirectinput.press(tecla_guardar)
+                        self.input.press(tecla_guardar)
                         time.sleep(0.8)
                         if regiao_erro_px is not None:
                             frame_erro = np.array(sct.grab(regiao_erro_px))[:, :, :3]
@@ -1032,17 +1357,20 @@ class FishingBotApp:
                             dup, frase = texto_contem_alguma_frase(texto, frases_duplicata)
                             if dup:
                                 self.log(f"Mensagem de duplicata ('{frase}'). Descartando com Backspace.")
-                                pydirectinput.press("backspace")
+                                self.input.press("backspace")
                             else:
                                 self.log("Sem mensagem de erro - fruta guardada normalmente.")
                         else:
                             self.log("Area de mensagem de erro nao calibrada - nao foi possivel confirmar.")
 
-                    time.sleep(1.0)
-                    baseline_cinza = preparar_para_diff(np.array(sct.grab(regiao_slot_px))[:, :, :3])
-                    contagem_mudanca = 0
-                    ultimo_disparo = time.time()
-                    self.pausar_para_fruta.clear()
+                    if not ocr_inconclusivo:
+                        time.sleep(1.0)
+                        baseline_cinza = preparar_para_diff(np.array(sct.grab(regiao_slot_px))[:, :, :3])
+                        contagem_mudanca = 0
+                        ultimo_disparo = time.time()
+                        self.pausar_para_fruta.clear()
+                    else:
+                        contagem_mudanca = 0
 
                 time.sleep(0.4)
 
@@ -1050,10 +1378,12 @@ class FishingBotApp:
         regiao_pct = cfg.get("regiao_contador_isca")
         if not regiao_pct:
             return
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]
+        with ScreenCapture() as sct:
+            monitor = monitor_principal(sct)
             largura, altura = monitor["width"], monitor["height"]
-            regiao_px = calcular_regiao_pixels(regiao_pct, largura, altura)
+            regiao_px = calcular_regiao_pixels(
+                regiao_pct, largura, altura, monitor["left"], monitor["top"]
+            )
 
             leituras_zeradas = 0
 
@@ -1064,26 +1394,28 @@ class FishingBotApp:
 
                 frame = np.array(sct.grab(regiao_px))[:, :, :3]
                 numero = ler_numero(frame)
-                leituras_zeradas = leituras_zeradas + 1 if (numero == 0 or numero is None) else 0
+                leitura = decidir_leitura_isca(numero, leituras_zeradas)
+                leituras_zeradas = leitura["zeros_consecutivos"]
 
-                if leituras_zeradas >= 3:
+                if leitura["acao"] == "acabou":
                     cfg_atual = self._carregar_config_completa()
                     isca_fallback = cfg_atual.get("isca_fallback", "Nenhum (pausar)")
                     posicoes = cfg_atual.get("posicoes_isca", [])
                     posicao = next((p for p in posicoes if p["nome"] == isca_fallback), None)
 
                     if posicao:
-                        x_abs = int(posicao["x_pct"] * largura)
-                        y_abs = int(posicao["y_pct"] * altura)
-                        pydirectinput.click(x_abs, y_abs)
+                        x_abs = monitor["left"] + int(posicao["x_pct"] * largura)
+                        y_abs = monitor["top"] + int(posicao["y_pct"] * altura)
+                        self.input.click(x_abs, y_abs)
                         self.log(f"Isca acabou - troquei automaticamente para '{isca_fallback}'.")
                         time.sleep(1.0)
                     else:
                         self.log("ISCA ACABOU e nenhum fallback configurado. Pausando o macro. "
                                  "Troque manualmente e clique 'Continuar'.")
                         self.pausar_sem_isca.set()
-                        pydirectinput.mouseUp()
-                        self.root.after(0, lambda: self.btn_continuar_isca.config(state="normal"))
+                        self.input.mouse_up()
+                        self._definir_estado(BotState.PAUSADO_ISCA)
+                        self._agendar_ui(lambda: self.btn_continuar_isca.config(state="normal"))
                         self.set_status("pausado - sem isca", "orange")
 
                     leituras_zeradas = 0
@@ -1094,7 +1426,7 @@ class FishingBotApp:
 
     def _registrar_hotkey_emergencia(self):
         try:
-            keyboard.add_hotkey(HOTKEY_PARAR, self.parar_macro)
+            self._hotkey_handle = keyboard.add_hotkey(HOTKEY_PARAR, self.parar_macro)
         except Exception as e:
             self.log(f"Aviso: nao foi possivel registrar {HOTKEY_PARAR.upper()} "
                      f"(tente rodar como administrador). Erro: {e}")

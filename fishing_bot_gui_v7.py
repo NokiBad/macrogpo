@@ -35,7 +35,11 @@ import difflib
 import threading
 import queue
 import tempfile
+import ctypes
+import ctypes.wintypes
+import sys
 from enum import Enum
+from dataclasses import dataclass
 from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -156,6 +160,139 @@ class ScreenCapture:
         self._captura.close()
 
 
+@dataclass(frozen=True)
+class ScreenPoint:
+    x: int
+    y: int
+
+
+@dataclass(frozen=True)
+class WindowRect:
+    left: int
+    top: int
+    width: int
+    height: int
+
+    @property
+    def right(self):
+        return self.left + self.width
+
+    @property
+    def bottom(self):
+        return self.top + self.height
+
+    def contains(self, point):
+        return self.left <= point.x < self.right and self.top <= point.y < self.bottom
+
+
+@dataclass(frozen=True)
+class WindowSnapshot:
+    hwnd: int
+    title: str
+    client: WindowRect
+    monitor: WindowRect
+    dpi: int
+    foreground: bool
+    minimized: bool
+
+
+def point_from_pct(area, client):
+    """Converte uma região percentual da área cliente em coordenadas de tela."""
+    if not validar_regiao_pct(area):
+        raise ValueError("Regiao percentual invalida.")
+    return WindowRect(
+        client.left + int(area["x1_pct"] * client.width),
+        client.top + int(area["y1_pct"] * client.height),
+        max(1, int((area["x2_pct"] - area["x1_pct"]) * client.width)),
+        max(1, int((area["y2_pct"] - area["y1_pct"]) * client.height)),
+    )
+
+
+def ponto_dentro_cliente(point, client):
+    return client.contains(point)
+
+
+class WindowTracker:
+    """Localiza janela/cliente com APIs documentadas; nunca lê memória ou injeta."""
+
+    def __init__(self, title_hint="Roblox", capture_factory=ScreenCapture):
+        self.title_hint = title_hint.lower()
+        self.capture_factory = capture_factory
+        self._user32 = None
+        if sys.platform == "win32":
+            self._user32 = ctypes.windll.user32
+            try:
+                self._user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            except (AttributeError, OSError):
+                try:
+                    self._user32.SetProcessDPIAware()
+                except (AttributeError, OSError):
+                    pass
+
+    def _window_candidates(self):
+        if self._user32 is None:
+            return []
+        candidates = []
+        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def callback(hwnd, _):
+            length = self._user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                self._user32.GetWindowTextW(hwnd, buffer, length + 1)
+                if self.title_hint in buffer.value.lower():
+                    candidates.append((int(hwnd), buffer.value))
+            return True
+
+        self._user32.EnumWindows(enum_proc(callback), 0)
+        return candidates
+
+    def locate(self):
+        candidates = self._window_candidates()
+        if not candidates:
+            return None
+        foreground = int(self._user32.GetForegroundWindow())
+        hwnd, title = next(((h, t) for h, t in candidates if h == foreground), candidates[0])
+        rect = ctypes.wintypes.RECT()
+        if not self._user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            return None
+        origin = ctypes.wintypes.POINT(0, 0)
+        if not self._user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+            return None
+        client = WindowRect(origin.x, origin.y, rect.right - rect.left, rect.bottom - rect.top)
+        monitor_handle = self._user32.MonitorFromWindow(hwnd, 2)
+        monitor = WindowRect(client.left, client.top, client.width, client.height)
+        monitor_info = _monitor_info()
+        if monitor_handle and self._user32.GetMonitorInfoW(
+                monitor_handle, ctypes.byref(monitor_info)):
+            monitor = WindowRect(
+                monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+                monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
+                monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
+            )
+        try:
+            dpi = int(self._user32.GetDpiForWindow(hwnd))
+        except AttributeError:
+            dpi = 96
+        minimized = bool(self._user32.IsIconic(hwnd))
+        return WindowSnapshot(hwnd, title, client, monitor, dpi, hwnd == foreground, minimized)
+
+    def fallback(self):
+        with self.capture_factory() as sct:
+            monitor = monitor_principal(sct)
+        rect = WindowRect(monitor["left"], monitor["top"], monitor["width"], monitor["height"])
+        return WindowSnapshot(0, "monitor fallback", rect, rect, 96, True, False)
+
+    def snapshot(self):
+        return self.locate() or self.fallback()
+
+
+def _monitor_info():
+    info = ctypes.wintypes.MONITORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    return info
+
+
 def configuracao_padrao():
     return {
         "frutas_possuidas": [],
@@ -215,6 +352,65 @@ def normalizar_config(cfg):
         if chave in resultado and not validar_regiao_pct(resultado[chave]):
             resultado.pop(chave)
     return resultado
+
+
+def migrar_config_janela(cfg, snapshot):
+    """Migra regiões antigas de monitor para cliente sem alterar itens desconhecidos."""
+    cfg = normalizar_config(cfg)
+    referencia = cfg.get("referencia_coordenadas", "monitor")
+    if referencia == "cliente":
+        return cfg, False
+    monitor = snapshot.monitor
+    cliente = snapshot.client
+    for chave in ("regiao_pesca", "regiao_slot_fruta", "regiao_texto_erro",
+                  "regiao_contador_isca", "regiao_nome_fruta"):
+        area = cfg.get(chave)
+        if not validar_regiao_pct(area):
+            continue
+        tela = point_from_pct(area, monitor)
+        inter_left = max(tela.left, cliente.left)
+        inter_top = max(tela.top, cliente.top)
+        inter_right = min(tela.right, cliente.right)
+        inter_bottom = min(tela.bottom, cliente.bottom)
+        if inter_left >= inter_right or inter_top >= inter_bottom:
+            cfg.pop(chave, None)
+            continue
+        cfg[chave] = {
+            "x1_pct": (inter_left - cliente.left) / cliente.width,
+            "y1_pct": (inter_top - cliente.top) / cliente.height,
+            "x2_pct": (inter_right - cliente.left) / cliente.width,
+            "y2_pct": (inter_bottom - cliente.top) / cliente.height,
+        }
+    cfg["referencia_coordenadas"] = "cliente"
+    cfg["janela_calibracao"] = {
+        "width": cliente.width, "height": cliente.height, "dpi": snapshot.dpi,
+    }
+    return cfg, True
+
+
+def validar_contexto_calibracao(cfg, snapshot, tolerancia=0.20):
+    contexto = cfg.get("janela_calibracao", {})
+    if not contexto:
+        return True
+    largura = contexto.get("width", snapshot.client.width)
+    largura_ok = abs(largura - snapshot.client.width) <= snapshot.client.width * tolerancia
+    altura_ok = abs(contexto.get("height", snapshot.client.height) -
+                    snapshot.client.height) <= snapshot.client.height * tolerancia
+    dpi = contexto.get("dpi", snapshot.dpi)
+    return largura_ok and altura_ok and abs(dpi - snapshot.dpi) <= 24
+
+
+def janela_pronta(snapshot):
+    return snapshot.hwnd != 0 and snapshot.foreground and not snapshot.minimized
+
+
+def mesma_janela(a, b):
+    return (
+        a.hwnd == b.hwnd
+        and a.client == b.client
+        and a.monitor == b.monitor
+        and a.dpi == b.dpi
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +506,12 @@ class JanelaCalibracaoAreas:
         self.ao_confirmar = ao_confirmar
         cfg_existente = cfg_existente or {}
 
-        with ScreenCapture() as sct:
-            monitor = monitor_principal(sct)
-            self.origem_x = monitor["left"]
-            self.origem_y = monitor["top"]
-            self.largura = monitor["width"]
-            self.altura = monitor["height"]
+        snapshot = WindowTracker().snapshot()
+        self.origem_x = snapshot.client.left
+        self.origem_y = snapshot.client.top
+        self.largura = snapshot.client.width
+        self.altura = snapshot.client.height
+        self.dpi = snapshot.dpi
 
         self.janela = tk.Toplevel(parent)
         self.janela.overrideredirect(True)
@@ -389,12 +585,11 @@ class JanelaMarcarPonto:
 
     def __init__(self, parent, ao_confirmar):
         self.ao_confirmar = ao_confirmar
-        with ScreenCapture() as sct:
-            monitor = monitor_principal(sct)
-            self.origem_x = monitor["left"]
-            self.origem_y = monitor["top"]
-            self.largura = monitor["width"]
-            self.altura = monitor["height"]
+        snapshot = WindowTracker().snapshot()
+        self.origem_x = snapshot.client.left
+        self.origem_y = snapshot.client.top
+        self.largura = snapshot.client.width
+        self.altura = snapshot.client.height
 
         self.janela = tk.Toplevel(parent)
         self.janela.overrideredirect(True)
@@ -706,6 +901,7 @@ class FishingBotApp:
         self.estado = BotState.PARADO
         self.metrics = BotMetrics()
         self.input = InputController()
+        self.window_tracker = WindowTracker()
 
         self._montar_interface()
         self.root.after(50, self._drenar_atualizacoes_ui)
@@ -781,6 +977,11 @@ class FishingBotApp:
         self.btn_parar = ttk.Button(frame_botoes, text=f"Parar ({HOTKEY_PARAR.upper()})",
                                      command=self.parar_macro, state="disabled")
         self.btn_parar.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+
+        self.btn_diagnostico = ttk.Button(
+            frame_botoes, text="Diagnostico (sem interacao)", command=self.iniciar_diagnostico
+        )
+        self.btn_diagnostico.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
         frame_botoes.columnconfigure((0, 1), weight=1)
 
@@ -901,6 +1102,12 @@ class FishingBotApp:
         self.log("Overlay ao vivo: o jogo aparece por tras. Arraste os 5 retangulos "
                  "(os que ja estavam calibrados aparecem na posicao salva). ESC cancela sem salvar.")
         cfg_existente = self._carregar_config_completa()
+        snapshot = self.window_tracker.snapshot()
+        if janela_pronta(snapshot):
+            cfg_existente, migrada = migrar_config_janela(cfg_existente, snapshot)
+            if migrada:
+                self._salvar_config_completa(cfg_existente)
+                self.log("Configuracao antiga migrada antes da calibracao.")
         JanelaCalibracaoAreas(self.root, self._salvar_areas, cfg_existente)
 
     def _salvar_areas(self, area_pesca, area_slot, area_texto_erro,
@@ -917,6 +1124,11 @@ class FishingBotApp:
         cfg["regiao_contador_isca"] = area_contador_isca
         cfg["regiao_nome_fruta"] = area_nome_fruta
         cfg["resolucao_calibrada"] = list(resolucao)
+        snapshot = self.window_tracker.snapshot()
+        cfg["referencia_coordenadas"] = "cliente"
+        cfg["janela_calibracao"] = {
+            "width": resolucao[0], "height": resolucao[1], "dpi": snapshot.dpi,
+        }
         self._salvar_config_completa(cfg)
         self.log("Areas salvas. Proximo passo: calibrar cores.")
 
@@ -933,9 +1145,13 @@ class FishingBotApp:
         try:
             self.set_status("calibrando cores", "orange")
             with mss.mss() as sct:
-                monitor = monitor_principal(sct)
-                largura, altura = monitor["width"], monitor["height"]
-                frame = np.array(sct.grab(monitor))[:, :, :3]
+                snapshot = self.window_tracker.snapshot()
+                if not janela_pronta(snapshot):
+                    raise RuntimeError("Janela Roblox indisponivel para calibracao.")
+                area = {"top": snapshot.client.top, "left": snapshot.client.left,
+                        "width": snapshot.client.width, "height": snapshot.client.height}
+                largura, altura = snapshot.client.width, snapshot.client.height
+                frame = np.array(sct.grab(area))[:, :, :3]
 
             self.log("Clique na cor VERDE da zona-alvo da pesca. ESC confirma.")
             p1 = pegar_pontos(frame, largura, altura, "Cor da zona-alvo (ESC confirma)")
@@ -986,10 +1202,13 @@ class FishingBotApp:
     def _rodar_captura_baseline(self, cfg):
         time.sleep(3)
         with mss.mss() as sct:
-            monitor = monitor_principal(sct)
-            largura, altura = monitor["width"], monitor["height"]
+            snapshot = self.window_tracker.snapshot()
+            if not janela_pronta(snapshot):
+                raise RuntimeError("Janela Roblox indisponivel para baseline.")
+            largura, altura = snapshot.client.width, snapshot.client.height
             regiao_px = calcular_regiao_pixels(
-                cfg["regiao_slot_fruta"], largura, altura, monitor["left"], monitor["top"]
+                cfg["regiao_slot_fruta"], largura, altura,
+                snapshot.client.left, snapshot.client.top
             )
             frame = np.array(sct.grab(regiao_px))[:, :, :3]
         cv2.imwrite(BASELINE_PATH, frame)
@@ -1002,6 +1221,23 @@ class FishingBotApp:
 
     def iniciar_macro(self):
         cfg = self._carregar_config_completa()
+        snapshot = self.window_tracker.snapshot()
+        if not janela_pronta(snapshot):
+            messagebox.showwarning("Fishing Bot", "Coloque a janela do Roblox em primeiro plano e nao minimizada.")
+            self.log("Pre-voo bloqueado: janela Roblox sem foco ou minimizada.", logging.WARNING)
+            return
+        self.log("Pre-voo: Roblox=%s cliente=%sx%s monitor=%sx%s dpi=%s" % (
+            snapshot.title, snapshot.client.width, snapshot.client.height,
+            snapshot.monitor.width, snapshot.monitor.height, snapshot.dpi
+        ))
+        cfg, migrada = migrar_config_janela(cfg, snapshot)
+        if migrada:
+            self._salvar_config_completa(cfg)
+            self.log("Configuracao antiga migrada para coordenadas da area cliente.")
+        if not validar_contexto_calibracao(cfg, snapshot):
+            messagebox.showwarning("Fishing Bot", "A calibracao nao e compativel com a janela atual. Recalibre as areas.")
+            self.log("Pre-voo bloqueado: resolucao/DPI da calibracao incompatível.", logging.WARNING)
+            return
         faltando = [k for k in ("regiao_pesca", "cores") if k not in cfg]
         if faltando:
             messagebox.showwarning("Fishing Bot", "Complete os passos anteriores primeiro.")
@@ -1033,6 +1269,43 @@ class FishingBotApp:
             self._iniciar_worker(self._loop_deteccao_fruta, cfg)
         if self.var_monitorar_isca.get() and OCR_DISPONIVEL and "regiao_contador_isca" in cfg:
             self._iniciar_worker(self._loop_monitorar_isca, cfg)
+
+    def iniciar_diagnostico(self):
+        """Captura/inspeciona sem enviar mouse ou teclado."""
+        cfg = self._carregar_config_completa()
+        self._iniciar_worker(self._rodar_diagnostico, cfg)
+
+    def _rodar_diagnostico(self, cfg):
+        snapshot = self.window_tracker.snapshot()
+        self.log(
+            "Diagnostico: janela=%r hwnd=%s foco=%s minimizada=%s cliente=%sx%s+%s+%s "
+            "monitor=%sx%s+%s+%s dpi=%s" % (
+                snapshot.title, snapshot.hwnd, snapshot.foreground, snapshot.minimized,
+                snapshot.client.width, snapshot.client.height, snapshot.client.left, snapshot.client.top,
+                snapshot.monitor.width, snapshot.monitor.height, snapshot.monitor.left, snapshot.monitor.top,
+                snapshot.dpi,
+            )
+        )
+        if not janela_pronta(snapshot):
+            self.log("Diagnostico interrompido: janela Roblox nao esta pronta.", logging.WARNING)
+            return
+        with ScreenCapture() as sct:
+            area = {"top": snapshot.client.top, "left": snapshot.client.left,
+                    "width": snapshot.client.width, "height": snapshot.client.height}
+            frame = np.array(sct.grab(area))[:, :, :3]
+        self.log("Diagnostico: captura cliente=%sx%s media_bgr=%s" % (
+            frame.shape[1], frame.shape[0], np.mean(frame, axis=(0, 1)).round(1).tolist()
+        ))
+        for chave in ("regiao_pesca", "regiao_slot_fruta", "regiao_nome_fruta",
+                      "regiao_contador_isca", "regiao_texto_erro"):
+            area_pct = cfg.get(chave)
+            if validar_regiao_pct(area_pct):
+                regiao = point_from_pct(area_pct, snapshot.client)
+                self.log("Diagnostico: %s=%s dentro_cliente=%s" % (
+                    chave, regiao, ponto_dentro_cliente(
+                        ScreenPoint(regiao.left, regiao.top), snapshot.client
+                    )
+                ))
 
     def _iniciar_worker(self, alvo, cfg):
         trabalhador = threading.Thread(target=self._executar_worker, args=(alvo, cfg), daemon=True)
@@ -1113,10 +1386,13 @@ class FishingBotApp:
             time.sleep(1.0)
 
             with ScreenCapture() as sct:
-                monitor = monitor_principal(sct)
-                largura_atual, altura_atual = monitor["width"], monitor["height"]
+                snapshot = self.window_tracker.snapshot()
+                if not janela_pronta(snapshot):
+                    raise RuntimeError("Janela Roblox indisponivel no inicio da pesca.")
+                largura_atual, altura_atual = snapshot.client.width, snapshot.client.height
                 regiao_px = calcular_regiao_pixels(
-                    cfg["regiao_pesca"], largura_atual, altura_atual, monitor["left"], monitor["top"]
+                    cfg["regiao_pesca"], largura_atual, altura_atual,
+                    snapshot.client.left, snapshot.client.top
                 )
 
                 verde = cfg["cores"]["zona_verde"]
@@ -1157,6 +1433,15 @@ class FishingBotApp:
                 inicio_janela_fps = time.time()
 
                 while self.macro_rodando.is_set():
+                    atual = self.window_tracker.snapshot()
+                    if not janela_pronta(atual) or not mesma_janela(snapshot, atual):
+                        if not self.pausar_para_fruta.is_set():
+                            self._definir_estado(BotState.PAUSADO_FRUTA)
+                            self.input.mouse_up()
+                            self.log("Pesca pausada: janela perdeu foco ou mudou de layout.", logging.WARNING)
+                        self.pausar_para_fruta.set()
+                        time.sleep(0.5)
+                        continue
                     if self.pausar_para_fruta.is_set() or self.pausar_sem_isca.is_set():
                         if segurando:
                             self.input.mouse_up()
@@ -1278,22 +1563,35 @@ class FishingBotApp:
         frutas_possuidas = cfg.get("frutas_possuidas", [])
 
         with ScreenCapture() as sct:
-            monitor = monitor_principal(sct)
-            largura, altura = monitor["width"], monitor["height"]
+            snapshot = self.window_tracker.snapshot()
+            if not janela_pronta(snapshot):
+                raise RuntimeError("Janela Roblox indisponivel para deteccao de fruta.")
+            largura, altura = snapshot.client.width, snapshot.client.height
             regiao_slot_px = calcular_regiao_pixels(
-                cfg["regiao_slot_fruta"], largura, altura, monitor["left"], monitor["top"]
+                cfg["regiao_slot_fruta"], largura, altura,
+                snapshot.client.left, snapshot.client.top
             )
             regiao_erro_px = (calcular_regiao_pixels(
-                cfg["regiao_texto_erro"], largura, altura, monitor["left"], monitor["top"])
+                cfg["regiao_texto_erro"], largura, altura,
+                snapshot.client.left, snapshot.client.top)
                                if "regiao_texto_erro" in cfg else None)
             regiao_nome_px = (calcular_regiao_pixels(
-                cfg["regiao_nome_fruta"], largura, altura, monitor["left"], monitor["top"])
+                cfg["regiao_nome_fruta"], largura, altura,
+                snapshot.client.left, snapshot.client.top)
                                if "regiao_nome_fruta" in cfg else None)
 
             ultimo_disparo = 0
             contagem_mudanca = 0
 
             while self.macro_rodando.is_set():
+                atual = self.window_tracker.snapshot()
+                if not janela_pronta(atual) or not mesma_janela(snapshot, atual):
+                    self.pausar_para_fruta.set()
+                    self.input.mouse_up()
+                    self._definir_estado(BotState.PAUSADO_FRUTA)
+                    self.log("Deteccao pausada: janela Roblox mudou ou perdeu foco.", logging.WARNING)
+                    time.sleep(0.5)
+                    continue
                 agora = time.time()
                 if agora - ultimo_disparo < cooldown:
                     time.sleep(0.3)
@@ -1379,15 +1677,26 @@ class FishingBotApp:
         if not regiao_pct:
             return
         with ScreenCapture() as sct:
-            monitor = monitor_principal(sct)
-            largura, altura = monitor["width"], monitor["height"]
+            snapshot = self.window_tracker.snapshot()
+            if not janela_pronta(snapshot):
+                raise RuntimeError("Janela Roblox indisponivel para monitoramento de isca.")
+            largura, altura = snapshot.client.width, snapshot.client.height
             regiao_px = calcular_regiao_pixels(
-                regiao_pct, largura, altura, monitor["left"], monitor["top"]
+                regiao_pct, largura, altura,
+                snapshot.client.left, snapshot.client.top
             )
 
             leituras_zeradas = 0
 
             while self.macro_rodando.is_set():
+                atual = self.window_tracker.snapshot()
+                if not janela_pronta(atual) or not mesma_janela(snapshot, atual):
+                    self.pausar_sem_isca.set()
+                    self.input.mouse_up()
+                    self._definir_estado(BotState.PAUSADO_ISCA)
+                    self.log("Monitoramento de isca pausado: janela mudou ou perdeu foco.", logging.WARNING)
+                    time.sleep(0.5)
+                    continue
                 if self.pausar_sem_isca.is_set():
                     time.sleep(1.0)
                     continue
@@ -1404,8 +1713,11 @@ class FishingBotApp:
                     posicao = next((p for p in posicoes if p["nome"] == isca_fallback), None)
 
                     if posicao:
-                        x_abs = monitor["left"] + int(posicao["x_pct"] * largura)
-                        y_abs = monitor["top"] + int(posicao["y_pct"] * altura)
+                        x_abs = snapshot.client.left + int(posicao["x_pct"] * largura)
+                        y_abs = snapshot.client.top + int(posicao["y_pct"] * altura)
+                        if not ponto_dentro_cliente(ScreenPoint(x_abs, y_abs), snapshot.client):
+                            self.log("Clique de fallback bloqueado: ponto fora da area cliente.", logging.ERROR)
+                            continue
                         self.input.click(x_abs, y_abs)
                         self.log(f"Isca acabou - troquei automaticamente para '{isca_fallback}'.")
                         time.sleep(1.0)

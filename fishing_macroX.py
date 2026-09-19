@@ -931,7 +931,7 @@ class JanelaPosicoesIsca:
 class FishingBotApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Fishing Bot GPO v6")
+        self.root.title("Fishing Bot GPO")
         self.root.geometry("580x640")
         self.root.resizable(False, False)
 

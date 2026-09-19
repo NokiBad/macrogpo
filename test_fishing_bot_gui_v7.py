@@ -9,7 +9,7 @@ import fishing_bot_gui_v7 as bot
 from fishing_bot_gui_v7 import (
     WindowRect, WindowSnapshot, decidir_leitura_isca, decidir_ocr_fruta,
     janela_pronta, migrar_config_janela, mesma_janela, nome_bate_com_lista,
-    validar_contexto_calibracao,
+    normalizar_retangulo, validar_contexto_calibracao,
     point_from_pct, ponto_dentro_cliente,
 )
 
@@ -87,6 +87,13 @@ class ConfiguracaoTest(unittest.TestCase):
     def test_regiao_relativa_rejeita_percentuais_invalidos(self):
         with self.assertRaises(ValueError):
             point_from_pct({"x1_pct": 0.8, "y1_pct": 0, "x2_pct": 0.2, "y2_pct": 1}, WindowRect(0, 0, 100, 100))
+
+    def test_normalizacao_de_retangulo_limita_canvas_e_preserva_tamanho(self):
+        self.assertEqual(
+            normalizar_retangulo((120, -10, -20, 110), 100, 80),
+            (0, 0, 100, 80),
+        )
+        self.assertEqual(normalizar_retangulo((50, 40, 50, 40), 100, 80), (50, 40, 51, 41))
 
     def test_migracao_de_monitor_para_cliente_com_origem_negativa(self):
         snapshot = WindowSnapshot(

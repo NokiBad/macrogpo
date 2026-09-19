@@ -6,7 +6,12 @@ import unittest
 import queue
 
 import fishing_bot_gui_v7 as bot
-from fishing_bot_gui_v7 import decidir_leitura_isca, decidir_ocr_fruta, nome_bate_com_lista
+from fishing_bot_gui_v7 import (
+    WindowRect, WindowSnapshot, decidir_leitura_isca, decidir_ocr_fruta,
+    janela_pronta, migrar_config_janela, mesma_janela, nome_bate_com_lista,
+    validar_contexto_calibracao,
+    point_from_pct, ponto_dentro_cliente,
+)
 
 
 class DecisaoOcrTest(unittest.TestCase):
@@ -69,6 +74,54 @@ class ConfiguracaoTest(unittest.TestCase):
         )
         self.assertEqual(regiao["left"], -1820)
         self.assertEqual(regiao["top"], 200)
+
+    def test_regiao_relativa_preserva_origem_negativa(self):
+        cliente = WindowRect(-1920, 40, 1000, 800)
+        regiao = point_from_pct(
+            {"x1_pct": 0.1, "y1_pct": 0.2, "x2_pct": 0.4, "y2_pct": 0.5}, cliente
+        )
+        self.assertEqual(regiao.left, -1820)
+        self.assertEqual(regiao.top, 200)
+        self.assertTrue(ponto_dentro_cliente(type("P", (), {"x": -1800, "y": 250})(), cliente))
+
+    def test_regiao_relativa_rejeita_percentuais_invalidos(self):
+        with self.assertRaises(ValueError):
+            point_from_pct({"x1_pct": 0.8, "y1_pct": 0, "x2_pct": 0.2, "y2_pct": 1}, WindowRect(0, 0, 100, 100))
+
+    def test_migracao_de_monitor_para_cliente_com_origem_negativa(self):
+        snapshot = WindowSnapshot(
+            10, "Roblox", WindowRect(-1800, 100, 800, 600),
+            WindowRect(-1920, 0, 1920, 1080), 120, True, False,
+        )
+        cfg, mudou = migrar_config_janela({
+            "regiao_pesca": {"x1_pct": 0.05, "y1_pct": 0.1, "x2_pct": 0.15, "y2_pct": 0.2}
+        }, snapshot)
+        self.assertTrue(mudou)
+        self.assertEqual(cfg["referencia_coordenadas"], "cliente")
+        self.assertAlmostEqual(cfg["regiao_pesca"]["x1_pct"], 0.0)
+        self.assertAlmostEqual(cfg["regiao_pesca"]["y1_pct"], 0.013333, places=4)
+        self.assertEqual(cfg["janela_calibracao"]["dpi"], 120)
+
+    def test_janela_pronta_e_comparacao_de_layout(self):
+        snapshot = WindowSnapshot(1, "Roblox", WindowRect(0, 0, 100, 100),
+                                  WindowRect(0, 0, 100, 100), 96, True, False)
+        self.assertTrue(janela_pronta(snapshot))
+        self.assertFalse(janela_pronta(WindowSnapshot(
+            0, "fallback", snapshot.client, snapshot.monitor, 96, True, False)))
+        self.assertTrue(mesma_janela(snapshot, snapshot))
+        self.assertFalse(mesma_janela(snapshot, WindowSnapshot(
+            1, "Roblox", WindowRect(0, 0, 101, 100),
+            snapshot.monitor, 96, True, False)))
+
+    def test_contexto_rejeita_dpi_incompativel(self):
+        snapshot = WindowSnapshot(
+            1, "Roblox", WindowRect(0, 0, 1000, 800),
+            WindowRect(0, 0, 1920, 1080), 144, True, False,
+        )
+        self.assertFalse(validar_contexto_calibracao(
+            {"janela_calibracao": {"width": 1000, "height": 800, "dpi": 96}},
+            snapshot,
+        ))
 
 
 class MonitoramentoIscaTest(unittest.TestCase):

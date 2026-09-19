@@ -3,7 +3,7 @@ macro
 
 ## Fishing Bot GPO
 
-`fishing_bot_gui_v7.py` é um macro de pesca com interface Tkinter. Ele captura
+`fishing_macroX.py` é um macro de pesca com interface Tkinter. Ele captura
 áreas configuradas da janela do jogo, acompanha o minijogo de pesca e usa OCR
 somente para decisões de fruta e contador de isca. A automação não implementa
 combate, exploração, duplicação/obtenção indevida de itens, injeção, leitura ou
@@ -27,7 +27,7 @@ opcional do caminho padrão está no próprio script:
 Execute:
 
 ```text
-python fishing_bot_gui_v7.py
+python fishing_macroX.py
 ```
 
 Configure as áreas, cores, baseline, frutas e posições de isca pela interface.
@@ -126,10 +126,18 @@ Os testes de lógica pura não dependem de jogo, GUI ou captura real:
 
 ```text
 python -m unittest discover -v
-python -m py_compile fishing_bot_gui_v7.py
+python -m py_compile fishing_macroX.py
 git diff --check
 ```
 
 Eles cobrem OCR, contador de isca, configuração, salvamento, coordenadas com
 origem negativa, migração de monitor para cliente, limites, DPI, estados,
 finalização de workers, fallback de logging, métricas e geometria do overlay.
+
+### Renomeação do programa
+
+O arquivo principal e o módulo de testes usam os nomes `fishing_macroX.py` e
+`test_fishing_macroX.py`. O `X` faz parte literalmente do nome solicitado.
+O número de versão permanece somente no cabeçalho do arquivo/projeto; títulos
+da janela, textos da GUI, nomes de executável e documentação operacional não
+exibem mais a versão.

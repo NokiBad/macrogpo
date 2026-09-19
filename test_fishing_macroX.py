@@ -5,8 +5,8 @@ import tempfile
 import unittest
 import queue
 
-import fishing_bot_gui_v7 as bot
-from fishing_bot_gui_v7 import (
+import fishing_macroX as bot
+from fishing_macroX import (
     WindowRect, WindowSnapshot, decidir_leitura_isca, decidir_ocr_fruta,
     janela_pronta, migrar_config_janela, mesma_janela, nome_bate_com_lista,
     normalizar_retangulo, validar_contexto_calibracao,

@@ -50,6 +50,22 @@ import cv2
 import pydirectinput
 import keyboard
 
+
+def configurar_dpi_processo():
+    """Define DPI por monitor antes de criar Tk; usa fallback em Windows antigo."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)))
+    except (AttributeError, OSError):
+        try:
+            return bool(ctypes.windll.user32.SetProcessDPIAware())
+        except (AttributeError, OSError):
+            return False
+
+
+configurar_dpi_processo()
+
 try:
     import pytesseract
     CAMINHO_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -423,8 +439,7 @@ class RetanguloAjustavel:
     def __init__(self, canvas, x1, y1, x2, y2, cor, rotulo):
         self.canvas = canvas
         self.cor = cor
-        self.rect = canvas.create_rectangle(x1, y1, x2, y2, outline=cor, width=3,
-                                             fill=cor, stipple="gray12")
+        self.rect = canvas.create_rectangle(x1, y1, x2, y2, outline=cor, width=5, fill="")
         self.texto = canvas.create_text(x1 + 6, y1 - 12, text=rotulo, fill=cor,
                                          anchor="w", font=("Segoe UI", 10, "bold"))
         self.alcas = {}
@@ -479,16 +494,29 @@ class RetanguloAjustavel:
         self._atualizar_alcas()
 
     def coords_normalizadas_pct(self, largura_tela, altura_tela):
-        x1, y1, x2, y2 = self.coords()
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
+        x1, y1, x2, y2 = normalizar_retangulo(self.coords(), largura_tela, altura_tela)
         return {
             "x1_pct": x1 / largura_tela, "y1_pct": y1 / altura_tela,
             "x2_pct": x2 / largura_tela, "y2_pct": y2 / altura_tela,
         }
 
 
-COR_TRANSPARENTE = "#ff00fe"  # magenta quase-unico, improvavel de aparecer na UI do jogo
+def normalizar_retangulo(coords, largura, altura):
+    """Ordena e limita um retângulo ao canvas antes de persistir a calibração."""
+    if largura <= 0 or altura <= 0 or len(coords) != 4:
+        raise ValueError("Dimensoes do canvas invalidas.")
+    x1, y1, x2, y2 = coords
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    x1 = min(max(0, x1), largura - 1)
+    y1 = min(max(0, y1), altura - 1)
+    x2 = min(max(x1 + 1, x2), largura)
+    y2 = min(max(y1 + 1, y2), altura)
+    return x1, y1, x2, y2
+
+
+COR_OVERLAY = "#101820"
+ALPHA_OVERLAY = 0.28
 
 
 class JanelaCalibracaoAreas:
@@ -497,8 +525,8 @@ class JanelaCalibracaoAreas:
     rosa=nome da fruta pescada. Guardar/descartar a fruta e por TECLA
     (prompt do Roblox), sem precisar de retangulo/cor pra isso.
 
-    Overlay TRANSPARENTE (sem print de fundo): voce ve o jogo ao vivo por
-    tras da janela, os retangulos ficam desenhados por cima. Se ja existir
+    Overlay semi-transparente: voce ve o jogo ao vivo por tras da janela,
+    enquanto os retangulos ficam desenhados por cima. Se ja existir
     calibracao salva, cada retangulo comeca EXATAMENTE onde estava -
     corrigir so um deles nao mexe nos outros."""
 
@@ -517,11 +545,13 @@ class JanelaCalibracaoAreas:
         self.janela.overrideredirect(True)
         self.janela.geometry(f"{self.largura}x{self.altura}+{self.origem_x}+{self.origem_y}")
         self.janela.attributes("-topmost", True)
-        self.janela.configure(bg=COR_TRANSPARENTE)
-        self.janela.wm_attributes("-transparentcolor", COR_TRANSPARENTE)
+        self.janela.attributes("-alpha", ALPHA_OVERLAY)
+        self.janela.configure(bg=COR_OVERLAY)
+        self.janela.lift()
+        self.janela.focus_force()
 
         self.canvas = tk.Canvas(self.janela, width=self.largura, height=self.altura,
-                                 highlightthickness=0, bg=COR_TRANSPARENTE)
+                                 highlightthickness=0, bg=COR_OVERLAY)
         self.canvas.pack(fill="both", expand=True)
 
         def posicao_inicial(chave_config, padrao_px):
@@ -555,16 +585,22 @@ class JanelaCalibracaoAreas:
                                           (cx - 200, self.altura - 320, cx + 50, self.altura - 280))
         self.ret_nome_fruta = RetanguloAjustavel(self.canvas, x1, y1, x2, y2, "#E91E63", "NOME da fruta pescada")
 
-        frame_botoes = tk.Frame(self.janela, bg="black")
+        frame_botoes = tk.Frame(self.janela, bg="#101010")
         frame_botoes.place(relx=0.5, rely=0.98, anchor="s")
-        tk.Label(frame_botoes, text="Overlay ao vivo - o jogo aparece por tras. ESC ou Cancelar sai sem salvar.",
-                 bg="black", fg="white").pack(side="top", pady=(0, 4))
+        tk.Label(frame_botoes, text="Areas visiveis sobre o jogo. Arraste/redimensione; ESC ou Cancelar sai sem salvar.",
+                 bg="#101010", fg="white").pack(side="top", pady=(0, 4))
         tk.Button(frame_botoes, text="Confirmar", command=self._confirmar,
                   bg="#4CAF50", fg="white", padx=20, pady=8).pack(side="left", padx=5)
         tk.Button(frame_botoes, text="Cancelar", command=self.janela.destroy,
                   bg="#f44336", fg="white", padx=20, pady=8).pack(side="left", padx=5)
 
         self.janela.bind("<Escape>", lambda e: self.janela.destroy())
+        self.janela.after(100, self._garantir_visibilidade)
+
+    def _garantir_visibilidade(self):
+        if self.janela.winfo_exists():
+            self.janela.lift()
+            self.janela.attributes("-topmost", True)
 
     def _confirmar(self):
         resolucao = (self.largura, self.altura)
@@ -595,17 +631,25 @@ class JanelaMarcarPonto:
         self.janela.overrideredirect(True)
         self.janela.geometry(f"{self.largura}x{self.altura}+{self.origem_x}+{self.origem_y}")
         self.janela.attributes("-topmost", True)
-        self.janela.configure(bg=COR_TRANSPARENTE)
-        self.janela.wm_attributes("-transparentcolor", COR_TRANSPARENTE)
+        self.janela.attributes("-alpha", ALPHA_OVERLAY)
+        self.janela.configure(bg=COR_OVERLAY)
+        self.janela.lift()
+        self.janela.focus_force()
 
         self.canvas = tk.Canvas(self.janela, width=self.largura, height=self.altura,
-                                 highlightthickness=0, bg=COR_TRANSPARENTE)
+                                 highlightthickness=0, bg=COR_OVERLAY)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Button-1>", self._clicou)
         self.janela.bind("<Escape>", lambda e: self.janela.destroy())
+        self.janela.after(100, self._garantir_visibilidade)
 
         tk.Label(self.janela, text="Clique exatamente em cima do icone da isca desejada (ESC cancela)",
                  bg="black", fg="white", font=("Segoe UI", 12, "bold")).place(relx=0.5, rely=0.03, anchor="n")
+
+    def _garantir_visibilidade(self):
+        if self.janela.winfo_exists():
+            self.janela.lift()
+            self.janela.attributes("-topmost", True)
 
     def _clicou(self, event):
         x_pct = event.x / self.largura

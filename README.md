@@ -92,6 +92,25 @@ janela, HWND, foco, minimização, monitor, resolução, DPI, dimensões da capt
 e coordenadas das regiões. Esse modo não envia cliques, teclas ou movimentos de
 mouse e não altera o estado do jogo.
 
+### Correção do overlay de calibração
+
+O overlay de **Ajustar Areas** foi corrigido para evitar uma falha em que os
+logs apareciam, mas os cinco retângulos não eram visíveis. A causa provável era
+a combinação do `-transparentcolor` do Tkinter com `stipple` no canvas, agravada
+por diferenças entre pixels físicos e unidades Tk em telas com DPI escalado.
+
+A solução usa uma sobreposição semitransparente real (`alpha` 0.28), retângulos
+com contorno espesso sem preenchimento pontilhado, `topmost`/`lift`/foco
+reforçados e configuração de DPI por monitor antes de criar a interface. O
+jogo continua visível por trás, enquanto as áreas e alças permanecem
+arrastáveis, redimensionáveis, confirmáveis e canceláveis. As coordenadas são
+ordenadas e limitadas ao canvas antes de serem persistidas.
+
+Os testes automatizados cobrem a normalização/clamp da geometria, inclusive
+retângulos invertidos, limites do canvas e regiões mínimas. A validação visual
+do overlay Tkinter em uma máquina Windows com o Roblox aberto ainda é manual;
+este ambiente não executa uma GUI real nem captura uma janela do jogo.
+
 ## Limites e operação segura
 
 - A automação depende da janela correta do Roblox estar visível e em primeiro
@@ -113,4 +132,4 @@ git diff --check
 
 Eles cobrem OCR, contador de isca, configuração, salvamento, coordenadas com
 origem negativa, migração de monitor para cliente, limites, DPI, estados,
-finalização de workers, fallback de logging e métricas.
+finalização de workers, fallback de logging, métricas e geometria do overlay.

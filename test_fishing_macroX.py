@@ -10,7 +10,8 @@ from fishing_macroX import (
     WindowRect, WindowSnapshot, decidir_leitura_isca, decidir_ocr_fruta,
     janela_pronta, migrar_config_janela, mesma_janela, nome_bate_com_lista,
     normalizar_retangulo, validar_contexto_calibracao,
-    point_from_pct, ponto_dentro_cliente,
+    point_from_pct, ponto_dentro_cliente, validar_ponto_pct,
+    screen_point_from_pct,
 )
 
 
@@ -49,7 +50,7 @@ class ConfiguracaoTest(unittest.TestCase):
         })
         self.assertEqual(cfg["frutas_possuidas"], [])
         self.assertNotIn("regiao_slot_fruta", cfg)
-        self.assertEqual(cfg["fruta"]["tecla_guardar"], "e")
+        self.assertNotIn("tecla_guardar", cfg["fruta"])
 
     def test_salvamento_atômico_produz_json_completo(self):
         original = bot.CONFIG_PATH
@@ -87,6 +88,25 @@ class ConfiguracaoTest(unittest.TestCase):
     def test_regiao_relativa_rejeita_percentuais_invalidos(self):
         with self.assertRaises(ValueError):
             point_from_pct({"x1_pct": 0.8, "y1_pct": 0, "x2_pct": 0.2, "y2_pct": 1}, WindowRect(0, 0, 100, 100))
+
+    def test_ponto_store_fruit_preserva_origem_e_limites(self):
+        cliente = WindowRect(-1200, 80, 1000, 800)
+        ponto = {"x_pct": 0.25, "y_pct": 0.5}
+        self.assertTrue(validar_ponto_pct(ponto))
+        self.assertEqual(screen_point_from_pct(ponto, cliente), bot.ScreenPoint(-950, 480))
+        self.assertFalse(validar_ponto_pct({"x_pct": 1.1, "y_pct": 0.5}))
+        with self.assertRaises(ValueError):
+            screen_point_from_pct({"x_pct": 1.1, "y_pct": 0.5}, cliente)
+
+    def test_ponto_store_fruit_rejeita_contexto_dpi_incompativel(self):
+        snapshot = WindowSnapshot(
+            1, "Roblox", WindowRect(0, 0, 1000, 800),
+            WindowRect(0, 0, 1920, 1080), 144, True, False,
+        )
+        self.assertFalse(validar_contexto_calibracao(
+            {"janela_calibracao": {"width": 1000, "height": 800, "dpi": 96}},
+            snapshot,
+        ))
 
     def test_normalizacao_de_retangulo_limita_canvas_e_preserva_tamanho(self):
         self.assertEqual(

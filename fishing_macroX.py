@@ -6,13 +6,12 @@ Novidades desta versao:
   possui. O bot le o NOME da fruta pescada (OCR numa area calibravel) e
   compara com essa lista (comparacao tolerante a erro de OCR via
   difflib). Se bater -> descarta com Backspace ANTES de tentar guardar.
-  Se nao bater -> aperta a tecla do prompt "Store Fruit" e adiciona esse
+  Se nao bater -> clica no ponto calibrado do prompt "Store Fruit" e adiciona esse
   nome na lista automaticamente (evita duplicar da proxima vez).
-  Se a lista estiver vazia, cai no metodo antigo (apertar a tecla e ler
-  a mensagem de erro depois).
-- Guardar/descartar fruta agora e por TECLA (o "Store Fruit" do Roblox e
-  um ProximityPrompt, ativado apertando uma tecla - padrao E - e nao por
-  clique de mouse), entao nao precisa mais de retangulo/cor pra isso.
+  Se a lista estiver vazia, clica no ponto calibrado e le a mensagem de erro
+  depois.
+- Guardar fruta usa um ponto de clique calibrado na area cliente; descartar
+  fruta continua usando Backspace somente no fluxo de duplicata confirmado.
 - Selecao de isca: agora que a isca fica numa lista empilhada clicavel
   (nao um hotbar), voce marca a posicao de cada opcao na tela (um clique
   por isca, com nome). Quando o contador de isca zera, o bot clica
@@ -228,6 +227,29 @@ def ponto_dentro_cliente(point, client):
     return client.contains(point)
 
 
+def validar_ponto_pct(ponto):
+    if not isinstance(ponto, dict):
+        return False
+    try:
+        x, y = float(ponto["x_pct"]), float(ponto["y_pct"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+
+
+def screen_point_from_pct(ponto, client):
+    """Converte um ponto calibrado relativo ao cliente em coordenada de tela."""
+    if not validar_ponto_pct(ponto):
+        raise ValueError("Ponto percentual invalido.")
+    resultado = ScreenPoint(
+        client.left + int(float(ponto["x_pct"]) * client.width),
+        client.top + int(float(ponto["y_pct"]) * client.height),
+    )
+    if not ponto_dentro_cliente(resultado, client):
+        raise ValueError("Ponto fora da area cliente.")
+    return resultado
+
+
 class WindowTracker:
     """Localiza janela/cliente com APIs documentadas; nunca lê memória ou injeta."""
 
@@ -314,7 +336,6 @@ def configuracao_padrao():
         "frutas_possuidas": [],
         "posicoes_isca": [],
         "fruta": {
-            "tecla_guardar": "e",
             "limiar_diff": 20.0,
             "cooldown_segundos": 8.0,
             "limiar_nome": 0.6,
@@ -359,6 +380,7 @@ def normalizar_config(cfg):
         resultado["posicoes_isca"] = []
     fruta = configuracao_padrao()["fruta"]
     fruta.update(resultado.get("fruta") if isinstance(resultado.get("fruta"), dict) else {})
+    fruta.pop("tecla_guardar", None)
     resultado["fruta"] = fruta
     loop = configuracao_padrao()["loop"]
     loop.update(resultado.get("loop") if isinstance(resultado.get("loop"), dict) else {})
@@ -522,8 +544,8 @@ ALPHA_OVERLAY = 0.28
 class JanelaCalibracaoAreas:
     """5 retangulos: azul=barras de pesca, laranja=slot da fruta,
     ciano=area da mensagem de erro (duplicata), amarelo=contador de isca,
-    rosa=nome da fruta pescada. Guardar/descartar a fruta e por TECLA
-    (prompt do Roblox), sem precisar de retangulo/cor pra isso.
+    rosa=nome da fruta pescada. O ponto de Store Fruit e calibrado em uma
+    janela separada, relativo a area cliente.
 
     Overlay semi-transparente: voce ve o jogo ao vivo por tras da janela,
     enquanto os retangulos ficam desenhados por cima. Se ja existir
@@ -619,7 +641,8 @@ class JanelaMarcarPonto:
     """Overlay TRANSPARENTE de tela cheia para marcar UM ponto (posicoes de
     isca). Sem print de fundo - o jogo aparece ao vivo por tras."""
 
-    def __init__(self, parent, ao_confirmar):
+    def __init__(self, parent, ao_confirmar,
+                 texto="Clique no ponto desejado (ESC cancela)"):
         self.ao_confirmar = ao_confirmar
         snapshot = WindowTracker().snapshot()
         self.origem_x = snapshot.client.left
@@ -643,7 +666,7 @@ class JanelaMarcarPonto:
         self.janela.bind("<Escape>", lambda e: self.janela.destroy())
         self.janela.after(100, self._garantir_visibilidade)
 
-        tk.Label(self.janela, text="Clique exatamente em cima do icone da isca desejada (ESC cancela)",
+        tk.Label(self.janela, text=texto,
                  bg="black", fg="white", font=("Segoe UI", 12, "bold")).place(relx=0.5, rely=0.03, anchor="n")
 
     def _garantir_visibilidade(self):
@@ -975,15 +998,9 @@ class FishingBotApp:
         ttk.Checkbutton(frame_topo, text="Detectar fruta / verificar duplicata / descartar",
                          variable=self.var_deteccao_fruta).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        ttk.Label(frame_topo, text="Tecla do prompt 'Store Fruit' (Roblox, padrao E):").grid(
-            row=1, column=0, sticky="w", pady=(4, 0))
-        self.var_tecla_guardar = tk.StringVar(value=self._valor_config_fruta("tecla_guardar", "e"))
-        ttk.Entry(frame_topo, textvariable=self.var_tecla_guardar, width=6).grid(
-            row=1, column=1, sticky="w", pady=(4, 0))
-
         self.var_monitorar_isca = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame_topo, text="Monitorar isca e trocar/pausar quando acabar",
-                         variable=self.var_monitorar_isca).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                         variable=self.var_monitorar_isca).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(frame_topo, text="Isca de fallback ao acabar:").grid(row=3, column=0, sticky="w", pady=(8, 0))
         self.var_isca_fallback = tk.StringVar()
@@ -997,6 +1014,9 @@ class FishingBotApp:
         ttk.Button(frame_gerenciar, text="Minhas Frutas", command=self.abrir_minhas_frutas).pack(
             side="left", padx=5, fill="x", expand=True)
         ttk.Button(frame_gerenciar, text="Posicoes de Isca", command=self.abrir_posicoes_isca).pack(
+            side="left", padx=5, fill="x", expand=True)
+        ttk.Button(frame_gerenciar, text="Ponto Store Fruit",
+                   command=self.iniciar_calibracao_store_fruit).pack(
             side="left", padx=5, fill="x", expand=True)
 
         frame_botoes = ttk.Frame(self.root, padding=10)
@@ -1014,18 +1034,22 @@ class FishingBotApp:
         self.btn_iniciar = ttk.Button(frame_botoes, text="4. Iniciar Macro", command=self.iniciar_macro)
         self.btn_iniciar.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        self.btn_continuar_isca = ttk.Button(frame_botoes, text="Continuar (isca/OCR)",
+        self.btn_continuar_ocr = ttk.Button(frame_botoes, text="Continuar apos OCR",
+                                             command=self.continuar_apos_ocr, state="disabled")
+        self.btn_continuar_ocr.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
+
+        self.btn_continuar_isca = ttk.Button(frame_botoes, text="Continuar apos isca",
                                               command=self.continuar_apos_isca, state="disabled")
-        self.btn_continuar_isca.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
+        self.btn_continuar_isca.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
 
         self.btn_parar = ttk.Button(frame_botoes, text=f"Parar ({HOTKEY_PARAR.upper()})",
                                      command=self.parar_macro, state="disabled")
-        self.btn_parar.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+        self.btn_parar.grid(row=3, column=0, padx=5, pady=5, sticky="ew")
 
         self.btn_diagnostico = ttk.Button(
             frame_botoes, text="Diagnostico (sem interacao)", command=self.iniciar_diagnostico
         )
-        self.btn_diagnostico.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        self.btn_diagnostico.grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
         frame_botoes.columnconfigure((0, 1), weight=1)
 
@@ -1139,6 +1163,42 @@ class FishingBotApp:
             self._atualizar_combo_isca()
 
         JanelaPosicoesIsca(self.root, obter_posicoes, salvar_posicoes)
+
+    def iniciar_calibracao_store_fruit(self):
+        snapshot = self.window_tracker.snapshot()
+        if not janela_pronta(snapshot):
+            messagebox.showwarning(
+                "Fishing Bot",
+                "Coloque a janela do Roblox em primeiro plano e nao minimizada.",
+            )
+            return
+
+        def ao_clicar(x_pct, y_pct):
+            atual = self.window_tracker.snapshot()
+            if not janela_pronta(atual) or not mesma_janela(snapshot, atual):
+                self.log("Calibracao Store Fruit cancelada: janela mudou ou perdeu foco.",
+                         logging.WARNING)
+                return
+            ponto = {"x_pct": x_pct, "y_pct": y_pct}
+            try:
+                screen_point_from_pct(ponto, atual.client)
+            except ValueError as exc:
+                self.log(f"Ponto Store Fruit invalido: {exc}", logging.ERROR)
+                return
+            cfg = self._carregar_config_completa()
+            cfg["fruta"]["ponto_guardar_pct"] = ponto
+            cfg["fruta"]["janela_ponto"] = {
+                "width": atual.client.width,
+                "height": atual.client.height,
+                "dpi": atual.dpi,
+            }
+            self._salvar_config_completa(cfg)
+            self.log("Ponto Store Fruit calibrado relativo a area cliente.")
+
+        JanelaMarcarPonto(
+            self.root, ao_clicar,
+            "Clique no prompt Store Fruit (ESC cancela)",
+        )
 
     # --- passo 1: areas ---------------------------------------------------
 
@@ -1289,10 +1349,21 @@ class FishingBotApp:
         if self.var_deteccao_fruta.get() and not os.path.exists(BASELINE_PATH):
             messagebox.showwarning("Fishing Bot", "Capture o baseline do slot (passo 3) ou desmarque a deteccao de fruta.")
             return
+        fruta_cfg = cfg.get("fruta", {})
+        ponto_guardar = fruta_cfg.get("ponto_guardar_pct")
+        ponto_contexto = {"janela_calibracao": fruta_cfg.get("janela_ponto", {})}
+        if self.var_deteccao_fruta.get() and (
+                not validar_ponto_pct(ponto_guardar)
+                or not validar_contexto_calibracao(ponto_contexto, snapshot)):
+            messagebox.showwarning(
+                "Fishing Bot",
+                "Calibre o ponto Store Fruit antes de iniciar a deteccao de fruta.",
+            )
+            self.log("Pre-voo bloqueado: ponto Store Fruit nao calibrado.", logging.WARNING)
+            return
 
         cfg["isca_fallback"] = self.var_isca_fallback.get()
         cfg.setdefault("fruta", {})
-        cfg["fruta"]["tecla_guardar"] = self.var_tecla_guardar.get().strip() or "e"
         self._salvar_config_completa(cfg)
 
         self.macro_rodando.set()
@@ -1379,6 +1450,8 @@ class FishingBotApp:
             self._agendar_ui(lambda b=btn: b.config(state="normal"))
         self._agendar_ui(lambda: self.btn_parar.config(state="disabled"))
         self._agendar_ui(lambda: self.btn_continuar_isca.config(state="disabled"))
+        if hasattr(self, "btn_continuar_ocr"):
+            self._agendar_ui(lambda: self.btn_continuar_ocr.config(state="disabled"))
 
     def parar_macro(self):
         if self.macro_rodando.is_set():
@@ -1422,6 +1495,13 @@ class FishingBotApp:
         self._definir_estado(BotState.RODANDO)
         self.btn_continuar_isca.config(state="disabled")
         self.log("Retomando apos troca de isca ou revisao do OCR.")
+        self.set_status("rodando", "green")
+
+    def continuar_apos_ocr(self):
+        self.pausar_para_fruta.clear()
+        self._definir_estado(BotState.RODANDO)
+        self.btn_continuar_ocr.config(state="disabled")
+        self.log("Retomando apos revisao manual do OCR.")
         self.set_status("rodando", "green")
 
     def _loop_macro(self, cfg):
@@ -1603,7 +1683,6 @@ class FishingBotApp:
         cooldown = cfg_fruta.get("cooldown_segundos", 8)
         frases_duplicata = cfg_fruta.get("frases_duplicata", FRASES_DUPLICATA_PADRAO)
         limiar_nome = cfg_fruta.get("limiar_nome", 0.6)
-        tecla_guardar = cfg_fruta.get("tecla_guardar", "e")
         frutas_possuidas = cfg.get("frutas_possuidas", [])
 
         with ScreenCapture() as sct:
@@ -1671,29 +1750,30 @@ class FishingBotApp:
                             ja_resolvido = True
                         elif decisao["acao"] == "guardar":
                             self.log(f"Nome lido ('{texto_nome}') confirmado. "
-                                     f"Guardando com a tecla '{tecla_guardar}'.")
-                            self.input.press(tecla_guardar)
-                            if texto_nome:
+                                     "acionando ponto Store Fruit calibrado.")
+                            ja_resolvido = self._clicar_store_fruit()
+                            if ja_resolvido and texto_nome:
                                 nova_lista = frutas_possuidas + [texto_nome.title()]
                                 cfg_atual = self._carregar_config_completa()
                                 cfg_atual["frutas_possuidas"] = nova_lista
                                 self._salvar_config_completa(cfg_atual)
                                 self.log(f"Adicionei '{texto_nome.title()}' a lista de Minhas Frutas.")
-                            ja_resolvido = True
+                            if not ja_resolvido:
+                                ocr_inconclusivo = True
                         else:
                             self.log(f"PAUSADO: {decisao['motivo']} (texto='{texto_nome}', "
                                      f"score={decisao['score']:.2f}). Revise a fruta e clique Continuar.")
                             self._definir_estado(BotState.PAUSADO_FRUTA)
-                            self._agendar_ui(lambda: self.btn_continuar_isca.config(state="normal"))
+                            self._agendar_ui(lambda: self.btn_continuar_ocr.config(state="normal"))
                             ocr_inconclusivo = True
 
                     if not ja_resolvido and not ocr_inconclusivo:
-                        # sem lista manual configurada: aperta a tecla do prompt e checa mensagem de erro
-                        self.log(f"Apertando '{tecla_guardar}' (prompt Store Fruit). "
-                                 f"Verificando mensagem de erro...")
-                        self.input.press(tecla_guardar)
+                        # sem lista manual configurada: clica no prompt e checa mensagem de erro
+                        if not self._clicar_store_fruit():
+                            ocr_inconclusivo = True
+                        self.log("Store Fruit acionado por ponto calibrado. Verificando mensagem de erro...")
                         time.sleep(0.8)
-                        if regiao_erro_px is not None:
+                        if not ocr_inconclusivo and regiao_erro_px is not None:
                             frame_erro = np.array(sct.grab(regiao_erro_px))[:, :, :3]
                             texto = ler_texto(frame_erro)
                             dup, frase = texto_contem_alguma_frase(texto, frases_duplicata)
@@ -1702,7 +1782,7 @@ class FishingBotApp:
                                 self.input.press("backspace")
                             else:
                                 self.log("Sem mensagem de erro - fruta guardada normalmente.")
-                        else:
+                        elif not ocr_inconclusivo:
                             self.log("Area de mensagem de erro nao calibrada - nao foi possivel confirmar.")
 
                     if not ocr_inconclusivo:
@@ -1715,6 +1795,29 @@ class FishingBotApp:
                         contagem_mudanca = 0
 
                 time.sleep(0.4)
+
+    def _clicar_store_fruit(self):
+        """Clica somente no ponto calibrado dentro da janela Roblox focada."""
+        cfg = self._carregar_config_completa()
+        ponto = cfg.get("fruta", {}).get("ponto_guardar_pct")
+        snapshot = self.window_tracker.snapshot()
+        ponto_contexto = {"janela_calibracao": cfg.get("fruta", {}).get("janela_ponto", {})}
+        if (not janela_pronta(snapshot) or not validar_ponto_pct(ponto)
+                or not validar_contexto_calibracao(ponto_contexto, snapshot)):
+            self.log("Store Fruit bloqueado: janela sem foco ou ponto nao calibrado.",
+                     logging.WARNING)
+            self.pausar_para_fruta.set()
+            self._definir_estado(BotState.PAUSADO_FRUTA)
+            return False
+        try:
+            tela = screen_point_from_pct(ponto, snapshot.client)
+        except ValueError as exc:
+            self.log(f"Store Fruit bloqueado: {exc}", logging.ERROR)
+            self.pausar_para_fruta.set()
+            self._definir_estado(BotState.PAUSADO_FRUTA)
+            return False
+        self.input.click(tela.x, tela.y)
+        return True
 
     def _loop_monitorar_isca(self, cfg):
         regiao_pct = cfg.get("regiao_contador_isca")

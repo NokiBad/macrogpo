@@ -55,6 +55,11 @@ para workers, libera o mouse, remove a hotkey e fecha overlays.
   estado/controles de forma idempotente.
 - A configuração usa caminhos relativos ao arquivo, defaults explícitos,
   validação de regiões e salvamento atômico.
+- Store Fruit não usa mais tecla configurável: o ponto do prompt é calibrado
+  explicitamente na área cliente, convertido para coordenadas de tela somente
+  quando a janela Roblox está focada, não minimizada e o ponto permanece
+  dentro dos limites. Sem esse ponto calibrado, a detecção de fruta fica
+  bloqueada no pré-voo.
 - O log tenta usar `fishing_bot.log`; se o arquivo não puder ser aberto, há
   fallback explícito para o console, sem ocultar o erro.
 
@@ -67,6 +72,9 @@ para workers, libera o mouse, remove a hotkey e fecha overlays.
   explícito para o monitor capturado pelo `mss`.
 - As regiões são convertidas para coordenadas de tela a partir da área cliente,
   e cliques de fallback são bloqueados quando ficam fora dela.
+- O botão **Ponto Store Fruit** abre um overlay separado para marcar o prompt.
+  A calibração é salva como percentuais da área cliente, preservando monitores
+  com origem negativa e impedindo cliques em outra janela ou fora do cliente.
 
 ### Resolução, monitor e DPI
 
@@ -84,6 +92,10 @@ Antes de iniciar, o programa verifica se a janela está localizada, em primeiro
 plano, não minimizada e compatível com a calibração. Durante os workers, perda
 de foco, minimização ou mudança de posição/tamanho/monitor/DPI pausa a pesca e
 libera o mouse. O estado permanece pausado até uma ação explícita do usuário.
+
+Quando o OCR do nome da fruta é vazio ou inconclusivo, a pesca permanece
+pausada e o botão separado **Continuar apos OCR** exige revisão manual. O botão
+**Continuar apos isca** continua reservado à troca/revisão de isca.
 
 ### Diagnóstico sem interação
 
@@ -141,3 +153,14 @@ O arquivo principal e o módulo de testes usam os nomes `fishing_macroX.py` e
 O número de versão permanece somente no cabeçalho do arquivo/projeto; títulos
 da janela, textos da GUI, nomes de executável e documentação operacional não
 exibem mais a versão.
+
+### Store Fruit e limites da automação
+
+O fluxo normal de duplicata preserva o descarte por Backspace somente depois de
+OCR/lista ou mensagem de duplicata confirmarem que a fruta já existe. Para
+guardar uma fruta, o programa clica apenas no ponto Store Fruit calibrado pelo
+usuário; não adivinha coordenadas e não envia a ação quando a janela perdeu
+foco, mudou de tamanho/monitor/DPI ou não tem calibração válida. A confirmação
+visual do prompt e a calibração correta continuam sendo responsabilidade do
+usuário. Não foram adicionados combate, injeção, leitura de memória, bypass de
+anti-cheat, duplicação de itens, webhooks ou automação fora da pesca.
